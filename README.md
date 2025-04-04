@@ -1,4 +1,4 @@
-# Reya Workers - DEX Transaction Processing System
+# Reya Workers - Transaction Processing System
 
 A TypeScript-based system for processing DEX trading events using a distributed architecture with Redis queues and PostgreSQL for persistence.
 
