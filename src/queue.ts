@@ -1,4 +1,4 @@
-import { Queue, QueueScheduler } from 'bullmq';
+import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import * as dotenv from 'dotenv';
 import { TradeJobData, JobResult } from './types/job.types';
@@ -12,10 +12,7 @@ const connection = new Redis(process.env.REDIS_HOST || 'localhost', {
   enableReadyCheck: false
 });
 
-// Queue scheduler for handling delayed jobs and retries
-const scheduler = new QueueScheduler(QUEUE_NAME, {
-  connection,
-});
+
 
 export const tradeQueue = new Queue<TradeJobData, JobResult>(QUEUE_NAME, {
   connection,
@@ -32,12 +29,10 @@ export const tradeQueue = new Queue<TradeJobData, JobResult>(QUEUE_NAME, {
 
 // Graceful shutdown
 process.on('SIGTERM', async () => {
-  await scheduler.close();
   await tradeQueue.close();
 });
 
 process.on('SIGINT', async () => {
-  await scheduler.close();
   await tradeQueue.close();
 });
 
