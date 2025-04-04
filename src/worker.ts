@@ -1,4 +1,4 @@
-import { Worker } from 'bullmq';
+import { Worker, Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { ethers } from 'ethers';
 import * as dotenv from 'dotenv';
@@ -20,10 +20,23 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
-const connection = new Redis(process.env.REDIS_HOST || 'localhost', {
+// More detailed connection options for local Redis
+const redisOptions = {
+  host: process.env.REDIS_HOST || 'localhost',
+  port: process.env.REDIS_PORT ? parseInt(process.env.REDIS_PORT) : 6379,
   maxRetriesPerRequest: null,
-  enableReadyCheck: false
-});
+  enableReadyCheck: false,
+  retryStrategy: (times: number) => {
+    if (times > 3) {
+      console.error(`Redis connection failed after ${times} attempts`);
+      return null; // stop retrying
+    }
+    return Math.min(times * 200, 1000); // exponential backoff
+  }
+};
+
+console.log('Connecting to Redis at:', redisOptions.host, redisOptions.port);
+const connection = new Redis(redisOptions);
 
 const worker = new Worker<TradeJobData, JobResult>(
   QUEUE_NAME,
@@ -88,6 +101,11 @@ const worker = new Worker<TradeJobData, JobResult>(
   }
 );
 
+// Monitor all worker events
+worker.on('active', job => {
+  console.log(`Job ${job.id} has started processing`);
+});
+
 worker.on('completed', (job, result) => {
   if (result.success) {
     console.log(`Job ${job.id} completed successfully. TX Hash: ${result.txHash}`);
@@ -98,6 +116,38 @@ worker.on('completed', (job, result) => {
 
 worker.on('failed', (job, error) => {
   console.error(`Job ${job?.id} failed with error:`, error);
+});
+
+worker.on('error', error => {
+  console.error('Worker error:', error);
+});
+
+worker.on('stalled', jobId => {
+  console.warn(`Job ${jobId} has stalled`);
+});
+
+worker.on('progress', (job, progress) => {
+  console.log(`Job ${job.id} is ${progress}% complete`);
+});
+
+// Log queue metrics every 30 seconds
+const metricsQueue = new Queue(QUEUE_NAME, { connection });
+setInterval(async () => {
+  try {
+    const jobCounts = await metricsQueue.getJobCounts();
+    console.log('Queue metrics:', jobCounts);
+  } catch (error) {
+    console.error('Error getting queue metrics:', error);
+  }
+}, 30000);
+
+// Clean up metrics queue on shutdown
+process.on('SIGTERM', async () => {
+  await metricsQueue.close();
+});
+
+process.on('SIGINT', async () => {
+  await metricsQueue.close();
 });
 
 // Graceful shutdown

@@ -8,10 +8,10 @@ const queue_1 = require("./queue");
 const db_1 = require("./db");
 const uuid_1 = require("uuid");
 const job_types_1 = require("./types/job.types");
+const monitor_1 = require("./monitor");
 const app = (0, express_1.default)();
 app.use(express_1.default.json());
 app.post('/trade', async (req, res) => {
-    console.log('Trade request received:', req.body);
     try {
         const { to, data, amount, gasLimit } = req.body;
         if (!to || !data) {
@@ -49,6 +49,23 @@ app.post('/trade', async (req, res) => {
     }
 });
 // Get transaction status
+// Monitor queue status
+app.get('/monitor', async (req, res) => {
+    try {
+        const metrics = await (0, monitor_1.getQueueMetrics)();
+        res.json({
+            success: true,
+            metrics
+        });
+    }
+    catch (error) {
+        console.error('Error getting queue metrics:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get queue metrics'
+        });
+    }
+});
 app.get('/trade/:txId', async (req, res) => {
     try {
         const { txId } = req.params;
@@ -73,8 +90,25 @@ app.get('/trade/:txId', async (req, res) => {
     }
 });
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`API server running on port ${PORT}`);
+    // Check if DB and Redis are available
+    try {
+        await db_1.pool.query('SELECT 1');
+        console.log('Database connection established');
+    }
+    catch (error) {
+        console.error('Error connecting to database:', error);
+        process.exit(1);
+    }
+    try {
+        await queue_1.tradeQueue.getJobCounts();
+        console.log('Redis connection established');
+    }
+    catch (error) {
+        console.error('Error connecting to Redis:', error);
+        process.exit(1);
+    }
 });
 // Graceful shutdown
 process.on('SIGTERM', async () => {
