@@ -36,16 +36,17 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.txQueue = void 0;
+exports.tradeQueue = exports.QUEUE_NAME = void 0;
 const bullmq_1 = require("bullmq");
 const ioredis_1 = __importDefault(require("ioredis"));
 const dotenv = __importStar(require("dotenv"));
 dotenv.config();
+exports.QUEUE_NAME = 'trade-queue';
 const connection = new ioredis_1.default(process.env.REDIS_HOST || 'localhost', {
     maxRetriesPerRequest: null,
     enableReadyCheck: false
 });
-exports.txQueue = new bullmq_1.Queue('tx-queue', {
+exports.tradeQueue = new bullmq_1.Queue(exports.QUEUE_NAME, {
     connection,
     defaultJobOptions: {
         attempts: 3,
@@ -53,5 +54,14 @@ exports.txQueue = new bullmq_1.Queue('tx-queue', {
             type: 'exponential',
             delay: 1000,
         },
+        removeOnComplete: 100, // Keep last 100 completed jobs
+        removeOnFail: 100, // Keep last 100 failed jobs
     },
+});
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    await exports.tradeQueue.close();
+});
+process.on('SIGINT', async () => {
+    await exports.tradeQueue.close();
 });

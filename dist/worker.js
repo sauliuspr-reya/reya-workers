@@ -41,9 +41,14 @@ const ioredis_1 = __importDefault(require("ioredis"));
 const ethers_1 = require("ethers");
 const dotenv = __importStar(require("dotenv"));
 const db_1 = require("./db");
+const queue_1 = require("./queue");
+const job_types_1 = require("./types/job.types");
 dotenv.config();
 if (!process.env.PRIVATE_KEY) {
     throw new Error('PRIVATE_KEY environment variable is not set');
+}
+if (!process.env.RPC_URL) {
+    throw new Error('RPC_URL environment variable is not set');
 }
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const provider = new ethers_1.ethers.JsonRpcProvider(process.env.RPC_URL);
@@ -52,35 +57,70 @@ const connection = new ioredis_1.default(process.env.REDIS_HOST || 'localhost', 
     maxRetriesPerRequest: null,
     enableReadyCheck: false
 });
-const worker = new bullmq_1.Worker('tx-queue', async (job) => {
-    const { txId, to, data } = job.data;
+const worker = new bullmq_1.Worker(queue_1.QUEUE_NAME, async (job) => {
+    const { txId, to, data, amount, gasLimit } = job.data;
     try {
         // Update status to processing
-        await (0, db_1.updateTxStatus)(txId, 'PROCESSING');
-        // Send transaction
-        const tx = await wallet.sendTransaction({
+        await (0, db_1.updateTxStatus)(txId, job_types_1.JobStatus.PROCESSING);
+        // Prepare transaction
+        const txParams = {
             to,
             data,
-        });
+        };
+        if (amount) {
+            txParams.value = amount;
+        }
+        if (gasLimit) {
+            txParams.gasLimit = gasLimit;
+        }
+        // Send transaction
+        const tx = await wallet.sendTransaction(txParams);
         console.log(`Transaction sent: ${tx.hash}`);
         // Wait for confirmation
-        await tx.wait();
+        const receipt = await tx.wait();
+        if (receipt?.status === 0) {
+            throw new Error('Transaction failed');
+        }
         // Update status to completed
-        await (0, db_1.updateTxStatus)(txId, 'COMPLETED', tx.hash);
-        return { success: true, txHash: tx.hash };
+        await (0, db_1.updateTxStatus)(txId, job_types_1.JobStatus.COMPLETED, tx.hash);
+        return {
+            success: true,
+            txHash: tx.hash
+        };
     }
     catch (error) {
         console.error(`Error processing transaction ${txId}:`, error);
-        await (0, db_1.updateTxStatus)(txId, 'FAILED');
-        throw error;
+        await (0, db_1.updateTxStatus)(txId, job_types_1.JobStatus.FAILED);
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
     }
 }, {
     connection,
     concurrency: 5,
+    removeOnComplete: {
+        count: 100
+    },
+    removeOnFail: {
+        count: 100
+    }
 });
-worker.on('completed', job => {
-    console.log(`Job ${job.id} completed successfully`);
+worker.on('completed', (job, result) => {
+    if (result.success) {
+        console.log(`Job ${job.id} completed successfully. TX Hash: ${result.txHash}`);
+    }
+    else {
+        console.log(`Job ${job.id} completed with failure: ${result.error}`);
+    }
 });
 worker.on('failed', (job, error) => {
-    console.error(`Job ${job?.id} failed:`, error);
+    console.error(`Job ${job?.id} failed with error:`, error);
+});
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+    await worker.close();
+});
+process.on('SIGINT', async () => {
+    await worker.close();
 });
