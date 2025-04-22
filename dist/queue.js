@@ -36,12 +36,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.tradeQueue = exports.QUEUE_NAME = void 0;
+exports.responseQueueEvents = exports.queueEvents = exports.responseQueue = exports.tradeQueue = exports.RESPONSE_QUEUE_NAME = exports.QUEUE_NAME = void 0;
 const bullmq_1 = require("bullmq");
 const ioredis_1 = __importDefault(require("ioredis"));
 const dotenv = __importStar(require("dotenv"));
 dotenv.config();
 exports.QUEUE_NAME = 'trade-queue';
+exports.RESPONSE_QUEUE_NAME = 'trade-response-queue';
 // More detailed connection options for local Redis
 const redisOptions = {
     host: process.env.REDIS_HOST || 'localhost',
@@ -66,10 +67,24 @@ exports.tradeQueue = new bullmq_1.Queue(exports.QUEUE_NAME, {
         removeOnFail: 100, // Keep last 100 failed jobs
     },
 });
+// Response queue for worker to send updates back to API
+exports.responseQueue = new bullmq_1.Queue(exports.RESPONSE_QUEUE_NAME, {
+    connection,
+    defaultJobOptions: {
+        attempts: 1,
+        removeOnComplete: 100,
+        removeOnFail: 100,
+    },
+});
+// Queue events for tracking job events
+exports.queueEvents = new bullmq_1.QueueEvents(exports.QUEUE_NAME, { connection });
+exports.responseQueueEvents = new bullmq_1.QueueEvents(exports.RESPONSE_QUEUE_NAME, { connection });
 // Graceful shutdown
 process.on('SIGTERM', async () => {
     await exports.tradeQueue.close();
+    await exports.responseQueue.close();
 });
 process.on('SIGINT', async () => {
     await exports.tradeQueue.close();
+    await exports.responseQueue.close();
 });

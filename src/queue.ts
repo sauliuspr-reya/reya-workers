@@ -1,11 +1,12 @@
-import { Queue } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import Redis from 'ioredis';
 import * as dotenv from 'dotenv';
-import { TradeJobData, JobResult } from './types/job.types';
+import { TradeJobData, JobResult, TradeResponseData } from './types/job.types';
 
 dotenv.config();
 
 export const QUEUE_NAME = 'trade-queue';
+export const RESPONSE_QUEUE_NAME = 'trade-response-queue';
 
 // More detailed connection options for local Redis
 const redisOptions = {
@@ -34,12 +35,28 @@ export const tradeQueue = new Queue<TradeJobData, JobResult>(QUEUE_NAME, {
   },
 });
 
+// Response queue for worker to send updates back to API
+export const responseQueue = new Queue<TradeResponseData, void>(RESPONSE_QUEUE_NAME, {
+  connection,
+  defaultJobOptions: {
+    attempts: 1,
+    removeOnComplete: 100,
+    removeOnFail: 100,
+  },
+});
+
+// Queue events for tracking job events
+export const queueEvents = new QueueEvents(QUEUE_NAME, { connection });
+export const responseQueueEvents = new QueueEvents(RESPONSE_QUEUE_NAME, { connection });
+
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   await tradeQueue.close();
+  await responseQueue.close();
 });
 
 process.on('SIGINT', async () => {
   await tradeQueue.close();
+  await responseQueue.close();
 });
 

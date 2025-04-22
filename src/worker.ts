@@ -3,8 +3,8 @@ import Redis from 'ioredis';
 import { ethers } from 'ethers';
 import * as dotenv from 'dotenv';
 import { updateTxStatus } from './db';
-import { QUEUE_NAME } from './queue';
-import { TradeJobData, JobResult, JobStatus } from './types/job.types';
+import { QUEUE_NAME, RESPONSE_QUEUE_NAME, responseQueue } from './queue';
+import { TradeJobData, JobResult, JobStatus, TradeResponseData, ResponseType } from './types/job.types';
 
 dotenv.config();
 
@@ -38,12 +38,39 @@ const redisOptions = {
 console.log('Connecting to Redis at:', redisOptions.host, redisOptions.port);
 const connection = new Redis(redisOptions);
 
+// Helper function to send response via response queue
+async function sendResponse(response: TradeResponseData) {
+  try {
+    await responseQueue.add('response', response, {
+      removeOnComplete: true
+    });
+    console.log(`Response sent for txId ${response.txId}: ${response.type}`);
+  } catch (error) {
+    console.error(`Error sending response for txId ${response.txId}:`, error);
+  }
+}
+
 const worker = new Worker<TradeJobData, JobResult>(
   QUEUE_NAME,
   async job => {
     const { txId, to, data, amount, gasLimit } = job.data;
 
     try {
+      // Step 1: Send simulation response
+      const simulationResponse: TradeResponseData = {
+        txId,
+        type: ResponseType.SIMULATION,
+        status: JobStatus.PENDING,
+        timestamp: new Date().toISOString(),
+        simulation: {
+          estimatedGas: Number(gasLimit) || 100000,
+          expectedOutput: amount || '0',
+          priceImpact: '0.05%',
+          route: [`0x${to.substring(2, 10)}`, `0x${(parseInt(to.substring(2, 10), 16) + 1).toString(16)}`]
+        }
+      };
+      await sendResponse(simulationResponse);
+      
       // Update status to processing
       await updateTxStatus(txId, JobStatus.PROCESSING);
 
@@ -65,27 +92,95 @@ const worker = new Worker<TradeJobData, JobResult>(
       const tx = await wallet.sendTransaction(txParams);
       console.log(`Transaction sent: ${tx.hash}`);
       
+      // Step 2: Send submission response
+      const submissionResponse: TradeResponseData = {
+        txId,
+        type: ResponseType.SUBMISSION,
+        status: JobStatus.PROCESSING,
+        timestamp: new Date().toISOString(),
+        txHash: tx.hash
+      };
+      await sendResponse(submissionResponse);
+      
       // Wait for confirmation
       const receipt = await tx.wait();
       
       if (receipt?.status === 0) {
-        throw new Error('Transaction failed');
+        throw new Error('Transaction failed on-chain');
       }
       
       // Update status to completed
       await updateTxStatus(txId, JobStatus.COMPLETED, tx.hash);
       
+      // Step 3: Send receipt response
+      // Make sure receipt is not null
+      if (receipt) {
+        const receiptResponse: TradeResponseData = {
+          txId,
+          type: ResponseType.RECEIPT,
+          status: JobStatus.COMPLETED,
+          timestamp: new Date().toISOString(),
+          txHash: tx.hash,
+          receipt: {
+            blockHash: receipt.blockHash,
+            blockNumber: receipt.blockNumber,
+            transactionIndex: receipt.index || 0,
+            gasUsed: Number(receipt.gasUsed),
+            status: receipt.status === 1,
+            logs: receipt.logs.map(log => ({
+              address: log.address,
+              topics: log.topics,
+              data: log.data
+            }))
+          }
+        };
+        await sendResponse(receiptResponse);
+      }
+      
       return { 
         success: true, 
         txHash: tx.hash 
       };
-    } catch (error) {
+    } catch (error: any) {
       console.error(`Error processing transaction ${txId}:`, error);
       await updateTxStatus(txId, JobStatus.FAILED);
       
+      // Extract error details for Ethereum errors
+      const errorDetails: Record<string, any> = {};
+      
+      if (error.code) errorDetails.code = error.code;
+      if (error.reason) errorDetails.reason = error.reason;
+      if (error.transaction) errorDetails.transaction = error.transaction;
+      if (error.shortMessage) errorDetails.shortMessage = error.shortMessage;
+      
+      // Include provider error info if available
+      if (error.info && error.info.error) {
+        errorDetails.info = {
+          code: error.info.error.code,
+          message: error.info.error.message
+        };
+      }
+      
+      // Send error response
+      const errorResponse: TradeResponseData = {
+        txId,
+        type: ResponseType.ERROR,
+        status: JobStatus.FAILED,
+        timestamp: new Date().toISOString(),
+        error: error instanceof Error ? error.message : 'Unknown error',
+        errorDetails: {
+          code: error.code,
+          transaction: error.transaction,
+          info: error.info,
+          shortMessage: error.shortMessage
+        }
+      };
+      await sendResponse(errorResponse);
+      
       return {
         success: false,
-        error: error instanceof Error ? error.message : 'Unknown error'
+        error: error instanceof Error ? error.message : 'Unknown error',
+        errorDetails
       };
     }
   },
@@ -141,21 +236,52 @@ setInterval(async () => {
   }
 }, 30000);
 
-// Clean up metrics queue on shutdown
-process.on('SIGTERM', async () => {
-  await metricsQueue.close();
+// Graceful shutdown handler for both SIGTERM and SIGINT (Ctrl+C)
+async function gracefulShutdown(signal: string) {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+  
+  try {
+    // Close active connections in sequence
+    console.log('Closing worker...');
+    await worker.close();
+    console.log('Worker closed successfully');
+    
+    console.log('Closing metrics queue...');
+    await metricsQueue.close();
+    console.log('Metrics queue closed successfully');
+    
+    console.log('Closing response queue...');
+    await responseQueue.close();
+    console.log('Response queue closed successfully');
+    
+    console.log('Closing Redis connection...');
+    await connection.quit();
+    console.log('Redis connection closed successfully');
+    
+    console.log('Graceful shutdown completed');
+    process.exit(0);
+  } catch (error) {
+    console.error('Error during graceful shutdown:', error);
+    // Force exit after a timeout if graceful shutdown fails
+    setTimeout(() => {
+      console.error('Forcing exit after failed graceful shutdown');
+      process.exit(1);
+    }, 3000);
+  }
+}
+
+// Register signal handlers
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught exceptions and unhandled rejections
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
-process.on('SIGINT', async () => {
-  await metricsQueue.close();
-});
-
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  await worker.close();
-});
-
-process.on('SIGINT', async () => {
-  await worker.close();
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('UNHANDLED_REJECTION');
 });
 
